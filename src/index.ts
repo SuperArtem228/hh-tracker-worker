@@ -189,4 +189,4 @@ app.post("/telegram", async (c) => {
   return c.json({ ok: true });
 });
 
-export default app;
+export default app.fetch;
