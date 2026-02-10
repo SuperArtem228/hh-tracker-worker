@@ -1,3 +1,6 @@
+
+console.log("WEBHOOK HIT")
+
 export type Env = {
   BOT_TOKEN: string;
 };
