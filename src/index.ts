@@ -6,16 +6,12 @@ import {
   clearBuffer,
   ensureUser,
   getBuffer,
-  getUserSheet,
   getUserStats,
-  listUserResponses,
+  listResponses,
   markUpdateProcessed,
   updateLastAckAt,
-  upsertUserSheet,
-  clearUserSheet,
 } from "./storage";
-import { sendTelegramMessage } from "./telegram";
-import { appendRows, clearAndWriteAll, createAndShareSpreadsheet } from "./google";
+import { sendTelegramDocument, sendTelegramMessage, sendTelegramPhoto } from "./telegram";
 
 type TelegramUpdate = {
   update_id: number;
@@ -32,35 +28,183 @@ type Env = {
   DB: D1Database;
   BOT_TOKEN: string;
   TELEGRAM_WEBHOOK_SECRET?: string;
-  GOOGLE_SERVICE_ACCOUNT_JSON?: string;
 };
 
 const app = new Hono<{ Bindings: Env }>();
 
 app.get("/health", (c) => c.text("ok"));
 
-function formatStats(stats: Awaited<ReturnType<typeof getUserStats>>): string {
-  const order = ["Не просмотрен", "Просмотрен", "Тестовое", "Приглашение", "Собеседование", "Отказ"];
-  const lines = order
+const STATUS_ORDER = ["Не просмотрен", "Просмотрен", "Тестовое", "Приглашение", "Собеседование", "Отказ"];
+
+function prettyRole(role: string): string {
+  const m: Record<string, string> = {
+    product: "Product",
+    project: "Project",
+    analyst: "Analyst",
+    marketing: "Marketing",
+    design: "Design",
+    engineering: "Engineering",
+    sales: "Sales",
+    other: "Other",
+  };
+  return m[role] ?? role;
+}
+
+function prettyGrade(grade: string): string {
+  const m: Record<string, string> = {
+    junior: "Junior",
+    middle: "Middle",
+    senior: "Senior",
+    lead: "Lead",
+  };
+  return m[grade] ?? grade;
+}
+
+function formatBreakdown(title: string, breakdown: Record<string, number>, mapper?: (k: string) => string): string {
+  const entries = Object.entries(breakdown)
+    .sort((a, b) => b[1] - a[1])
+    .map(([k, v]) => `• ${(mapper ? mapper(k) : k)}: ${v}`);
+  return `${title}\n${entries.join("\n") || "• пока пусто"}`;
+}
+
+function formatStats(stats: Awaited<ReturnType<typeof getUserStats>>, days: number): string {
+  const statusLines = STATUS_ORDER
     .filter((s) => stats.statusBreakdown[s] != null)
-    .map((s) => `${s}: ${stats.statusBreakdown[s]}`);
+    .map((s) => `• ${s}: ${stats.statusBreakdown[s]}`);
+  const statusOther = Object.entries(stats.statusBreakdown)
+    .filter(([k]) => !STATUS_ORDER.includes(k))
+    .map(([k, v]) => `• ${k}: ${v}`);
 
-  const other = Object.entries(stats.statusBreakdown)
-    .filter(([k]) => !order.includes(k))
-    .map(([k, v]) => `${k}: ${v}`);
+  const breakdown = [...statusLines, ...statusOther].join("\n") || "• пока пусто";
 
-  const breakdown = [...lines, ...other].map((l) => `• ${l}`).join("\n") || "• пока пусто";
-  const top = stats.topCompanies.map((c) => `${c.name} (${c.count})`).join(", ") || "—";
   const last7 = stats.dailyActivity.slice(-7);
-  const activity = last7.length ? last7.map((d) => `${d.date}: ${d.count}`).join("\n") : "—";
+  const activity7 = last7.length ? last7.map((d) => `${d.date}: ${d.count}`).join("\n") : "—";
 
   return (
-    `📊 Статистика за 30 дней\n\n` +
+    `📊 Статистика за ${days} дней\n\n` +
     `Всего откликов: ${stats.totalResponses}\n\n` +
     `По статусам:\n${breakdown}\n\n` +
-    `Топ компаний: ${top}\n\n` +
-    `Активность (последние 7 дней):\n${activity}`
+    `${formatBreakdown("По ролям:", stats.roleBreakdown, prettyRole)}\n\n` +
+    `${formatBreakdown("По грейдам:", stats.gradeBreakdown, prettyGrade)}\n\n` +
+    `Активность (последние 7 дней):\n${activity7}`
   );
+}
+
+function csvEscape(v: unknown): string {
+  const s = String(v ?? "");
+  const needs = /[;"\n\r]/.test(s);
+  const out = s.replace(/"/g, '""');
+  return needs ? `"${out}"` : out;
+}
+
+function toCsv(rows: Awaited<ReturnType<typeof listResponses>>): string {
+  // Для Excel в RU-локали лучше ; + UTF-8 BOM
+  const header = ["Response date", "Company", "Vacancy title", "Status", "Role", "Grade", "Imported at"];
+  const lines = [header.join(";")];
+
+  for (const r of rows) {
+    lines.push(
+      [
+        csvEscape(r.response_date ?? ""),
+        csvEscape(r.company),
+        csvEscape(r.title),
+        csvEscape(r.status),
+        csvEscape(prettyRole(r.role_family)),
+        csvEscape(prettyGrade(r.grade)),
+        csvEscape(r.imported_at),
+      ].join(";")
+    );
+  }
+
+  return "\ufeff" + lines.join("\n");
+}
+
+function truncate(s: string, max: number): string {
+  if (s.length <= max) return s;
+  return s.slice(0, Math.max(0, max - 1)) + "…";
+}
+
+function formatTable(rows: Awaited<ReturnType<typeof listResponses>>): string {
+  const header = [
+    ["Date", 10],
+    ["Company", 18],
+    ["Title", 26],
+    ["Status", 12],
+    ["Role", 11],
+    ["Grade", 6],
+  ] as const;
+
+  const pad = (s: string, w: number) => {
+    const t = truncate(s, w);
+    return t + " ".repeat(Math.max(0, w - t.length));
+  };
+
+  const headLine = header.map(([h, w]) => pad(h, w)).join(" | ");
+  const sep = header.map(([_, w]) => "-".repeat(w)).join("-|-");
+
+  const lines = rows.map((r) => {
+    const date = (r.response_date ?? "").toString();
+    return [
+      pad(date, 10),
+      pad(r.company ?? "", 18),
+      pad(r.title ?? "", 26),
+      pad(r.status ?? "", 12),
+      pad(prettyRole(r.role_family ?? ""), 11),
+      pad(prettyGrade(r.grade ?? ""), 6),
+    ].join(" | ");
+  });
+
+  return "```\n" + [headLine, sep, ...lines].join("\n") + "\n```";
+}
+
+function quickChartUrl(config: unknown, w = 900, h = 500): string {
+  const c = encodeURIComponent(JSON.stringify(config));
+  return `https://quickchart.io/chart?c=${c}&w=${w}&h=${h}&v=3&devicePixelRatio=1&format=png&backgroundColor=white`;
+}
+
+function funnelChartUrl(statusBreakdown: Record<string, number>, days: number): string {
+  const labels = STATUS_ORDER;
+  const data = labels.map((l) => statusBreakdown[l] ?? 0);
+
+  const config = {
+    type: "funnel",
+    data: {
+      labels,
+      datasets: [{ label: "Count", data }],
+    },
+    options: {
+      indexAxis: "y",
+      plugins: {
+        legend: { display: false },
+        title: { display: true, text: `Воронка откликов (последние ${days} дней)` },
+      },
+      scales: { x: { beginAtZero: true } },
+    },
+  };
+
+  return quickChartUrl(config, 900, 520);
+}
+
+function trendChartUrl(daily: { date: string; count: number }[], days: number): string {
+  const labels = daily.map((d) => d.date);
+  const data = daily.map((d) => d.count);
+
+  const config = {
+    type: "line",
+    data: {
+      labels,
+      datasets: [{ label: "Отклики/день", data, fill: false, tension: 0.2 }],
+    },
+    options: {
+      plugins: {
+        legend: { display: false },
+        title: { display: true, text: `Отклики по дням (последние ${days} дней)` },
+      },
+      scales: { y: { beginAtZero: true } },
+    },
+  };
+
+  return quickChartUrl(config, 900, 420);
 }
 
 async function processUpdate(env: Env, update: TelegramUpdate) {
@@ -75,25 +219,29 @@ async function processUpdate(env: Env, update: TelegramUpdate) {
   const user = await ensureUser({ DB: env.DB }, userId, chatId);
 
   if (isCommand) {
-    const [cmd, ...args] = text.split(" ");
+    const [cmdRaw, ...args] = text.split(" ");
+    const cmd = cmdRaw.toLowerCase();
 
     switch (cmd) {
       case "/start":
-        await sendTelegramMessage(env, chatId, (
+        await sendTelegramMessage(
+          env,
+          chatId,
           "Привет! Я HH Tracker.\n\n" +
-          "Как пользоваться:\n" +
-          "1) /new\n" +
-          "2) Вставляй копипасту из hh.ru (можно частями)\n" +
-          "3) /done — я распарсю и сохраню\n\n" +
-          "Команды:\n" +
-          "/new — очистить буфер\n" +
-          "/done — распарсить и сохранить\n" +
-          "/stats — статистика за 30 дней\n" +
-          "/connect <email> — создать таблицу Google Sheets и подключить экспорт\n" +
-          "/sheet — ссылка на твою таблицу\n" +
-          "/sync — пересобрать таблицу из базы\n" +
-          "/reset — очистить буфер"
-        ));
+            "Как пользоваться:\n" +
+            "1) /new\n" +
+            "2) Вставляй копипасту из hh.ru (можно частями)\n" +
+            "3) /done — я распарсю и сохраню\n\n" +
+            "Команды:\n" +
+            "/new — очистить буфер\n" +
+            "/done — распарсить и сохранить\n" +
+            "/stats [7|30|90] — статистика (по умолчанию 30 дней)\n" +
+            "/funnel [7|30|90] — картинка-воронка\n" +
+            "/trend [7|30|90] — график откликов по дням\n" +
+            "/table [n] — последние n строк таблицей (по умолчанию 15)\n" +
+            "/export [7|30|90|all] — CSV-файл\n" +
+            "/reset — очистить буфер"
+        );
         return;
 
       case "/new":
@@ -119,172 +267,80 @@ async function processUpdate(env: Env, update: TelegramUpdate) {
           return;
         }
 
-        const { inserted, duplicates, insertedRows } = await addResponses({ DB: env.DB }, userId, parsed);
+        const { inserted, duplicates } = await addResponses({ DB: env.DB }, userId, parsed);
         await clearBuffer({ DB: env.DB }, userId);
 
-        const sheet = await getUserSheet({ DB: env.DB }, userId);
-        let sheetNote = "";
-        if (sheet && insertedRows.length) {
-          try {
-            const rows = insertedRows.map((p) => [
-              p.responseDate ?? "",
-              p.company,
-              p.title,
-              p.status,
-              p.roleFamily,
-              p.grade,
-            ]);
-            await appendRows(env, sheet.spreadsheet_id, rows);
-            sheetNote = `\n\nТаблица обновлена: https://docs.google.com/spreadsheets/d/${sheet.spreadsheet_id}/edit`;
-          } catch (e) {
-            console.log("Sheets append error", e);
-            sheetNote =
-              `\n\n⚠️ В Google Sheets не записал (в базу всё сохранил). ` +
-              `Сделай /sync, чтобы пересобрать таблицу.`;
-          }
-        } else if (sheet && !insertedRows.length) {
-          sheetNote = `\n\nТаблица: https://docs.google.com/spreadsheets/d/${sheet.spreadsheet_id}/edit`;
-        }
+        const days = 30;
+        const stats = await getUserStats({ DB: env.DB }, userId, days);
 
         await sendTelegramMessage(
           env,
           chatId,
-          `Готово. Добавлено: ${inserted}. Дублей: ${duplicates}.` + sheetNote + `\n\nНапиши /stats, чтобы посмотреть статистику.`
+          `Готово. Добавлено: ${inserted}. Дублей: ${duplicates}.\n\n` +
+            `Хочешь в табличном виде — /export или /table.\n` +
+            `Обновлённая статистика: /stats`
         );
+
+        // Воронка как картинка (лучше, чем ASCII). Если Telegram не сможет скачать — просто в логах будет ошибка.
+        await sendTelegramPhoto(env, chatId, funnelChartUrl(stats.statusBreakdown, days));
+
         return;
       }
 
       case "/stats": {
-        const stats = await getUserStats({ DB: env.DB }, userId, 30);
-        await sendTelegramMessage(env, chatId, formatStats(stats));
+        const days = Math.min(Math.max(parseInt(args[0] || "30", 10) || 30, 1), 365);
+        const stats = await getUserStats({ DB: env.DB }, userId, days);
+        await sendTelegramMessage(env, chatId, formatStats(stats, days));
         return;
       }
 
-      case "/sheet": {
-        const sheet = await getUserSheet({ DB: env.DB }, userId);
-        if (!sheet) {
-          await sendTelegramMessage(env, chatId, "Таблица не подключена. Напиши /connect you@gmail.com");
-          return;
-        }
-        await sendTelegramMessage(env, chatId, `Твоя таблица:
-https://docs.google.com/spreadsheets/d/${sheet.spreadsheet_id}/edit`);
+      case "/funnel": {
+        const days = Math.min(Math.max(parseInt(args[0] || "30", 10) || 30, 1), 365);
+        const stats = await getUserStats({ DB: env.DB }, userId, days);
+        await sendTelegramPhoto(env, chatId, funnelChartUrl(stats.statusBreakdown, days));
         return;
       }
 
-      case "/sync": {
-        const sheet = await getUserSheet({ DB: env.DB }, userId);
-        if (!sheet) {
-          await sendTelegramMessage(env, chatId, "Таблица не подключена. Напиши /connect you@gmail.com");
-          return;
-        }
-        if (!env.GOOGLE_SERVICE_ACCOUNT_JSON) {
-          await sendTelegramMessage(env, chatId, "Экспорт в Google Sheets не настроен на сервере (нет GOOGLE_SERVICE_ACCOUNT_JSON).");
-          return;
-        }
-
-        try {
-          const all = await listUserResponses({ DB: env.DB }, userId, 2000);
-          const rows = all.map((r) => [
-            r.response_date ?? "",
-            r.company,
-            r.title,
-            r.status,
-            r.role_family,
-            r.grade,
-          ]);
-          await clearAndWriteAll(env, sheet.spreadsheet_id, rows);
-          await sendTelegramMessage(
-            env,
-            chatId,
-            `Ок. Пересобрал таблицу (${rows.length} строк):
-https://docs.google.com/spreadsheets/d/${sheet.spreadsheet_id}/edit`
-          );
-        } catch (e) {
-          console.log("sync error", e);
-          await sendTelegramMessage(env, chatId, "Не получилось пересобрать таблицу. Попробуй позже.");
-        }
+      case "/trend": {
+        const days = Math.min(Math.max(parseInt(args[0] || "30", 10) || 30, 1), 365);
+        const stats = await getUserStats({ DB: env.DB }, userId, days);
+        await sendTelegramPhoto(env, chatId, trendChartUrl(stats.dailyActivity, days));
         return;
       }
 
-      case "/disconnect": {
-        await clearUserSheet({ DB: env.DB }, userId);
-        await sendTelegramMessage(env, chatId, "Ок. Таблицу отключил. Если надо снова — /connect you@gmail.com");
+      case "/table": {
+        const n = Math.min(Math.max(parseInt(args[0] || "15", 10) || 15, 1), 50);
+        const rows = await listResponses({ DB: env.DB }, userId, { limit: n });
+        if (!rows.length) {
+          await sendTelegramMessage(env, chatId, "Пока пусто. Добавь отклики через /new → текст → /done.");
+          return;
+        }
+        await sendTelegramMessage(env, chatId, formatTable(rows));
+        return;
+      }
+
+      case "/export": {
+        const arg = (args[0] || "30").toLowerCase();
+        const days = arg === "all" ? undefined : Math.min(Math.max(parseInt(arg, 10) || 30, 1), 365);
+        const rows = await listResponses({ DB: env.DB }, userId, { days, limit: 5000 });
+        if (!rows.length) {
+          await sendTelegramMessage(env, chatId, "Пока пусто. Добавь отклики через /new → текст → /done.");
+          return;
+        }
+        const csv = toCsv(rows);
+        const suffix = days ? `${days}d` : "all";
+        const filename = `hh-responses-${suffix}.csv`;
+        await sendTelegramDocument(env, chatId, filename, "text/csv; charset=utf-8", csv);
         return;
       }
 
       case "/connect": {
-        const email = args[0]?.trim();
-        if (!email) {
-          await sendTelegramMessage(
-            env,
-            chatId,
-            `Чтобы подключить Google Sheets, напиши:
-/connect you@gmail.com
-
-Я создам таблицу и расшарю её на этот email.`
-          );
-          return;
-        }
-
-        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-          await sendTelegramMessage(env, chatId, "Похоже, email странный. Пример: /connect you@gmail.com");
-          return;
-        }
-
-        if (!env.GOOGLE_SERVICE_ACCOUNT_JSON) {
-          await sendTelegramMessage(
-            env,
-            chatId,
-            "Экспорт в Google Sheets не настроен на сервере (нет GOOGLE_SERVICE_ACCOUNT_JSON)."
-          );
-          return;
-        }
-
-        const existing = await getUserSheet({ DB: env.DB }, userId);
-        if (existing && existing.email.toLowerCase() === email.toLowerCase()) {
-          await sendTelegramMessage(
-            env,
-            chatId,
-            `Уже подключено: ${existing.email}
-Таблица: https://docs.google.com/spreadsheets/d/${existing.spreadsheet_id}/edit
-
-Если хочешь пересобрать — /sync.`
-          );
-          return;
-        }
-
-        await sendTelegramMessage(env, chatId, "Ок. Создаю таблицу и подключаю…");
-
-        try {
-          const title = `HH Tracker — ${email}`;
-          const info = await createAndShareSpreadsheet(env, title, email);
-
-          await upsertUserSheet({ DB: env.DB }, userId, email, info.spreadsheetId);
-
-          // Первый экспорт: сразу кладём текущие данные из базы в таблицу
-          const all = await listUserResponses({ DB: env.DB }, userId, 2000);
-          const rows = all.map((r) => [
-            r.response_date ?? "",
-            r.company,
-            r.title,
-            r.status,
-            r.role_family,
-            r.grade,
-          ]);
-          await clearAndWriteAll(env, info.spreadsheetId, rows);
-
-          await sendTelegramMessage(
-            env,
-            chatId,
-            `Готово. Таблица создана и расшарена на ${email}:
-${info.url}
-
-Дальше она будет обновляться после /done. Если нужно пересобрать — /sync.`
-          );
-        } catch (e) {
-          console.log("connect error", e);
-          await sendTelegramMessage(env, chatId, "Не получилось создать/расшарить таблицу. Проверь настройки Google Sheets и попробуй ещё раз.");
-        }
+        // Sheets отключены — без Google Cloud делать нормально без OAuth нельзя.
+        await sendTelegramMessage(
+          env,
+          chatId,
+          "Google Sheets сейчас отключены. Вместо этого используй /export — я пришлю CSV (открывается в Excel/Numbers/Google Sheets)."
+        );
         return;
       }
 
