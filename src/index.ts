@@ -201,8 +201,10 @@ app.post("/telegram", async (c) => {
   return c.json({ ok: true });
 });
 
-export const fetch = (request: Request, env: Env, ctx: ExecutionContext) =>
-  app.fetch(request, env, ctx);
+export default {
+  fetch(request: Request, env: Env, ctx: ExecutionContext) {
+    return app.fetch(request, env, ctx);
+  },
+};
 
-export default { fetch };
 
