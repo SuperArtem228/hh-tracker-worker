@@ -1,9 +1,0 @@
-name = "hh-tracker-worker"
-main = "src/index.ts"
-compatibility_date = "2026-02-11"
-
-# После создания D1 базы вставь database_id сюда.
-[[d1_databases]]
-binding = "DB"
-database_name = "hh-tracker-db"
-database_id = "PASTE_DATABASE_ID_HERE"
