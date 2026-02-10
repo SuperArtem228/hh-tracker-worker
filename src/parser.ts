@@ -1,12 +1,24 @@
 import { fnv1a64Hex } from "./hash";
 
+export type RoleFamily =
+  | "product"
+  | "project"
+  | "analyst"
+  | "marketing"
+  | "design"
+  | "engineering"
+  | "sales"
+  | "other";
+
+export type Grade = "junior" | "middle" | "senior" | "lead";
+
 export type ParsedResponse = {
   title: string;
   company: string;
   status: string;
   responseDate: string;
-  roleFamily: "product" | "project" | "analyst" | "marketing" | "other";
-  grade: "junior" | "middle" | "senior" | "lead";
+  roleFamily: RoleFamily;
+  grade: Grade;
   hash: string;
   raw: string;
 };
@@ -59,20 +71,39 @@ function extractDate(blockLines: string[]): string | null {
   return null;
 }
 
-function detectRoleFamily(title: string): ParsedResponse["roleFamily"] {
+function detectRoleFamily(title: string): RoleFamily {
   const t = title.toLowerCase();
-  if (/(analyst|аналит)/i.test(t)) return "analyst";
-  if (/(project|проджект|проект)/i.test(t)) return "project";
-  if (/(marketing|маркет)/i.test(t)) return "marketing";
+
+  // analyst / data
+  if (/(analyst|аналит|data analyst|дата-аналит)/i.test(t)) return "analyst";
+
+  // product
   if (/(product|продакт|продукт)/i.test(t) || t.includes("менеджер по продукт")) return "product";
+
+  // project / delivery
+  if (/(project|проджект|проект|delivery|scrum)/i.test(t)) return "project";
+
+  // marketing / growth / performance
+  if (/(marketing|маркет|growth|performance|acquisition|smm|таргет)/i.test(t)) return "marketing";
+
+  // design
+  if (/(designer|дизайн|ux\/?ui|ux|ui)/i.test(t)) return "design";
+
+  // engineering / dev
+  if (/(developer|devops|engineer|инженер|разработ|frontend|backend|fullstack|qa|тестиров)/i.test(t))
+    return "engineering";
+
+  // sales / bizdev
+  if (/(sales|продаж|bizdev|business development|аккаунт|account)/i.test(t)) return "sales";
+
   return "other";
 }
 
-function detectGrade(title: string): ParsedResponse["grade"] {
+function detectGrade(title: string): Grade {
   const t = title.toLowerCase();
-  if (/(junior|джун|младш|intern|стаж)/i.test(t)) return "junior";
-  if (/(lead|team\s*lead|тим\s*лид|head|руковод)/i.test(t)) return "lead";
-  if (/(senior|старш)/i.test(t)) return "senior";
+  if (/(intern|стаж|trainee|младш|junior|джун)/i.test(t)) return "junior";
+  if (/(lead|head|руковод|team lead|тимлид)/i.test(t)) return "lead";
+  if (/(senior|старш|principal|staff)/i.test(t)) return "senior";
   return "middle";
 }
 
