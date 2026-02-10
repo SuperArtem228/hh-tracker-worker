@@ -9,12 +9,9 @@
   - вставлять копипасту из hh.ru (можно частями)
   - `/done` → распарсить и сохранить
   - `/stats` → получить статистику за 30 дней
-  - `/connect you@gmail.com` → создать таблицу Google Sheets и подключить экспорт
-  - `/sheet` → ссылка на таблицу
-  - `/sync` → пересобрать таблицу из базы
 - Данные каждого пользователя хранятся **отдельно** (разделение по Telegram user_id).
 - Хранение: **Cloudflare D1 (SQLite)**.
-- Есть экспорт в Google Sheets: /connect <email> создаёт личную таблицу и дальше /done автоматически дописывает новые строки.
+- Никакой Google Sheets в этой версии нет (позже добавим экспорт).
 
 ## 0. Что нужно установить локально
 
@@ -101,28 +98,14 @@ https://api.telegram.org/bot<ТОКЕН>/setWebhook?url=<WORKER_URL>/telegram&se
 
 
 
-## 4. Экспорт в Google Sheets (создание таблицы для каждого пользователя)
+## Команды бота
 
-Схема такая: воркер создаёт таблицу **в аккаунте service account** и шарит её на email пользователя (таблица появится в Google Drive → "Доступные мне").
+- `/new` — очистить буфер
+- `/done` — распарсить и сохранить
+- `/stats [7|30|90]` — статистика (по умолчанию 30 дней)
+- `/funnel [7|30|90]` — воронка картинкой
+- `/trend [7|30|90]` — график откликов по дням
+- `/table [n]` — последние n строк таблицей
+- `/export [7|30|90|all]` — CSV-файл (для Excel/Google Sheets)
 
-### 4.1 Создай service account и ключ
-
-1) Google Cloud Console → создай проект
-2) Включи API:
-   - Google Sheets API
-   - Google Drive API
-3) Создай Service Account и скачай ключ **JSON**
-
-### 4.2 Добавь секрет в Cloudflare Worker
-
-Workers & Pages → hh-tracker-worker → Settings → Variables → Secrets:
-
-- `GOOGLE_SERVICE_ACCOUNT_JSON` = содержимое скачанного JSON (целиком)
-
-### 4.3 Подключение пользователем
-
-В Telegram:
-
-- `/connect you@gmail.com`
-
-Бот создаст таблицу, расшарит на email и даст ссылку. Дальше после `/done` новые строки будут автоматически добавляться в таблицу.
+> Google Sheets интеграция отключена (без Google Cloud).
